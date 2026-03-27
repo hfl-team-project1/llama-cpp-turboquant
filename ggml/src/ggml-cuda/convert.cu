@@ -808,6 +808,75 @@ static void dequantize_row_turbo3_0_cuda(const void * vx, dst_t * y, const int64
     dequantize_block_turbo3_0<<<nb_groups, 64, 0, stream>>>(vx, y, nb_groups);
 }
 
+// Turbo3 non-contiguous dequant: handles strided KV cache layout (multi-slot)
+template<typename dst_t>
+static __global__ void dequantize_block_turbo3_0_nc(
+        const void * __restrict__ vx, dst_t * __restrict__ yy,
+        int64_t ne00, int64_t ne01, int64_t ne0203, uint3 ne02_fdv,
+        int64_t s01, int64_t s02, int64_t s03) {
+
+    const int grp_in_row = blockIdx.x; // group index within row
+
+    for (int64_t i01 = blockIdx.y; i01 < ne01; i01 += gridDim.y) {
+        for (int64_t i0203 = blockIdx.z; i0203 < ne0203; i0203 += gridDim.z) {
+            const uint2 dm = fast_div_modulo((uint32_t)i0203, ne02_fdv);
+            const int64_t i02 = dm.y;
+            const int64_t i03 = dm.x;
+
+            const int64_t ibx0 = i03*s03 + i02*s02 + i01*s01;
+            const block_turbo3_0 * blocks = (const block_turbo3_0 *)vx + ibx0 + grp_in_row * 4;
+
+            const int64_t y_offset = (i0203*ne01 + i01)*ne00 + grp_in_row * QK_TURBO3_GROUP;
+            dst_t * y = yy + y_offset;
+
+            __shared__ float s_data[QK_TURBO3_GROUP];
+
+            for (int j = threadIdx.x; j < QK_TURBO3_GROUP; j += blockDim.x) {
+                const int ib = j / QK_TURBO3;
+                const int jj = j % QK_TURBO3;
+                const float norm = __half2float(blocks[ib].norm);
+                const uint8_t low2 = (blocks[ib].qs[jj/4] >> ((jj%4)*2)) & 0x3;
+                const uint8_t hi1  = (blocks[ib].signs[jj/8] >> (jj%8)) & 0x1;
+                const uint8_t idx  = low2 | (hi1 << 2);
+                s_data[j] = turbo_centroids_3bit_dq[idx] * norm * dq_turbo_wht_signs2[j];
+            }
+            __syncthreads();
+
+            for (int h = 1; h < 128; h *= 2) {
+                for (int j = threadIdx.x; j < 64; j += blockDim.x) {
+                    const int idx = (j / h) * (h * 2) + (j % h);
+                    const float a = s_data[idx];
+                    const float b = s_data[idx + h];
+                    s_data[idx]     = a + b;
+                    s_data[idx + h] = a - b;
+                }
+                __syncthreads();
+            }
+
+            const float inv_sqrt_128 = 0.08838834764831845f;
+            for (int j = threadIdx.x; j < QK_TURBO3_GROUP; j += blockDim.x) {
+                y[j] = (dst_t)(s_data[j] * inv_sqrt_128 * dq_turbo_wht_signs1[j]);
+            }
+            __syncthreads(); // sync before next row reuses s_data
+        }
+    }
+}
+
+template<typename dst_t>
+static void dequantize_row_turbo3_0_nc_cuda(const void * vx, dst_t * y,
+        int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+        int64_t s01, int64_t s02, int64_t s03, cudaStream_t stream) {
+    GGML_ASSERT(ne00 % QK_TURBO3_GROUP == 0);
+    const int groups_per_row = ne00 / QK_TURBO3_GROUP;
+    const int64_t ne0203 = ne02 * ne03;
+    const uint3 ne02_fdv = init_fastdiv_values((uint32_t)ne02);
+    const dim3 grid(groups_per_row,
+                    (int)std::min(ne01, (int64_t)65535),
+                    (int)std::min(ne0203, (int64_t)65535));
+    dequantize_block_turbo3_0_nc<<<grid, 64, 0, stream>>>(
+        vx, y, ne00, ne01, ne0203, ne02_fdv, s01, s02, s03);
+}
+
 template<typename dst_t>
 static __global__ void dequantize_block_turbo4_0(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb) {
     const int i = blockIdx.x;
@@ -979,6 +1048,8 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16>;
+        case GGML_TYPE_TURBO3_0:
+            return dequantize_row_turbo3_0_nc_cuda;
         default:
             return nullptr;
     }
@@ -1021,6 +1092,8 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16, float>;
+        case GGML_TYPE_TURBO3_0:
+            return dequantize_row_turbo3_0_nc_cuda;
         default:
             return nullptr;
     }
