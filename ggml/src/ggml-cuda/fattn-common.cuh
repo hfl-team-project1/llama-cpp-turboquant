@@ -577,6 +577,80 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     }
 }
 
+// ============================================================================
+// Turbo3 inline dequant for flash attention
+// No inverse WHT — pre-rotate-queries handles rotation at graph level
+// ============================================================================
+
+static const __device__ float fattn_turbo3_centroids[8] = {
+    -0.190685f, -0.117832f, -0.065717f, -0.021460f,
+     0.021460f,  0.065717f,  0.117832f,  0.190685f
+};
+
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_turbo3_0 * K_turbo = (const block_turbo3_0 *) K_c;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
+    constexpr int cpy_ne = cpy_nb / 4; // number of half2-equivalent pairs per thread per iteration
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
+#pragma unroll
+        for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
+            const int k_KQ = k_KQ_0 + (threadIdx.x % nthreads)*cpy_ne + k_KQ_1;
+            const int j  = k_KQ * 2;
+            const int ib = j / QK_TURBO3;
+            const int jj = j % QK_TURBO3;
+
+            const float norm = __half2float(K_turbo[ib].norm);
+
+            const uint8_t lo0 = (K_turbo[ib].qs[ jj   /4] >> (( jj   %4)*2)) & 0x3;
+            const uint8_t hi0 = (K_turbo[ib].signs[jj  /8] >> ( jj   %8))    & 0x1;
+            const uint8_t lo1 = (K_turbo[ib].qs[(jj+1)/4] >> (((jj+1)%4)*2)) & 0x3;
+            const uint8_t hi1 = (K_turbo[ib].signs[(jj+1)/8] >> ((jj+1)%8))  & 0x1;
+
+            const float K0 = fattn_turbo3_centroids[lo0 | (hi0 << 2)] * norm;
+            const float K1 = fattn_turbo3_centroids[lo1 | (hi1 << 2)] * norm;
+
+            const float2 Q_val = ((const float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
+            sum += K0 * Q_val.x + K1 * Q_val.y;
+        }
+    }
+
+    return sum;
+}
+
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_turbo3_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_turbo3_0 * x = (const block_turbo3_0 *) vx;
+
+    const int64_t ib  = i0 / QK_TURBO3;
+    const int     iqs = i0 % QK_TURBO3;
+
+    const float norm = __half2float(x[ib].norm);
+
+#pragma unroll
+    for (int l = 0; l < ne; ++l) {
+        const int jj = iqs + l;
+        const uint8_t lo = (x[ib].qs[ jj   /4] >> (( jj   %4)*2)) & 0x3;
+        const uint8_t hi = (x[ib].signs[jj /8] >> ( jj    %8))    & 0x1;
+        const float val = fattn_turbo3_centroids[lo | (hi << 2)] * norm;
+
+        if constexpr (std::is_same_v<T, half>) {
+            ((half *) dst)[l] = __float2half(val);
+        } else if constexpr (std::is_same_v<T, float>) {
+            ((float *) dst)[l] = val;
+        }
+    }
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -593,6 +667,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TURBO3_0) {
+        return vec_dot_fattn_vec_KQ_turbo3_0<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -615,6 +691,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q8_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TURBO3_0) {
+        return dequantize_V_turbo3_0<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;
