@@ -757,7 +757,7 @@ static const __device__ float dq_turbo_wht_signs2[128] = {
 };
 
 // Turbo3 dequant: processes 128-element groups (4 blocks) with inverse WHT
-// One GPU block per group, uses shared memory for the WHT butterfly
+// 32 threads per GPU block — all threads participate in every phase
 template<typename dst_t>
 static __global__ void dequantize_block_turbo3_0(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb_groups) {
     const int grp = blockIdx.x;
@@ -768,7 +768,7 @@ static __global__ void dequantize_block_turbo3_0(const void * __restrict__ vx, d
 
     __shared__ float s_data[QK_TURBO3_GROUP]; // 128 floats = 512 bytes
 
-    // Step 1: Dequant all 128 elements — centroid lookup × norm
+    // Step 1: Dequant all 128 elements + multiply by signs2 (parallel, 4 elements/thread)
     for (int j = threadIdx.x; j < QK_TURBO3_GROUP; j += blockDim.x) {
         const int ib = j / QK_TURBO3;
         const int jj = j % QK_TURBO3;
@@ -777,35 +777,27 @@ static __global__ void dequantize_block_turbo3_0(const void * __restrict__ vx, d
         const uint8_t low2 = (blocks[ib].qs[jj/4] >> ((jj%4)*2)) & 0x3;
         const uint8_t hi1  = (blocks[ib].signs[jj/8] >> (jj%8)) & 0x1;
         const uint8_t idx  = low2 | (hi1 << 2);
-        s_data[j] = turbo_centroids_3bit_dq[idx] * norm;
+        s_data[j] = turbo_centroids_3bit_dq[idx] * norm * dq_turbo_wht_signs2[j];
     }
     __syncthreads();
 
-    // Step 2: Inverse WHT rotation (signs2 → FWHT → signs1)
-    // Single-threaded: 128-element WHT is ~1000 FP ops, negligible at GPU scale
-    if (threadIdx.x == 0) {
-        // Multiply by signs2
-        for (int i = 0; i < 128; i++) s_data[i] *= dq_turbo_wht_signs2[i];
-        // FWHT (self-inverse)
-        for (int h = 1; h < 128; h *= 2) {
-            for (int i = 0; i < 128; i += h * 2) {
-                for (int j = i; j < i + h; j++) {
-                    float a = s_data[j];
-                    float b = s_data[j + h];
-                    s_data[j]     = a + b;
-                    s_data[j + h] = a - b;
-                }
-            }
+    // Step 2: Parallel FWHT — 7 stages, 64 independent butterflies each
+    // Each stage: all 32 threads process 64 butterfly pairs (2 pairs/thread)
+    for (int h = 1; h < 128; h *= 2) {
+        for (int j = threadIdx.x; j < 64; j += blockDim.x) {
+            const int idx = (j / h) * (h * 2) + (j % h);
+            const float a = s_data[idx];
+            const float b = s_data[idx + h];
+            s_data[idx]     = a + b;
+            s_data[idx + h] = a - b;
         }
-        // Normalize by 1/sqrt(128) and multiply by signs1
-        const float inv_sqrt_128 = 0.08838834764831845f;
-        for (int i = 0; i < 128; i++) s_data[i] *= inv_sqrt_128 * dq_turbo_wht_signs1[i];
+        __syncthreads();
     }
-    __syncthreads();
 
-    // Step 3: Write output
+    // Step 3: Normalize + signs1 + write output (parallel, 4 elements/thread)
+    const float inv_sqrt_128 = 0.08838834764831845f;
     for (int j = threadIdx.x; j < QK_TURBO3_GROUP; j += blockDim.x) {
-        y[j] = (dst_t)s_data[j];
+        y[j] = (dst_t)(s_data[j] * inv_sqrt_128 * dq_turbo_wht_signs1[j]);
     }
 }
 
@@ -813,7 +805,7 @@ template<typename dst_t>
 static void dequantize_row_turbo3_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     GGML_ASSERT(k % QK_TURBO3_GROUP == 0);
     const int nb_groups = k / QK_TURBO3_GROUP;
-    dequantize_block_turbo3_0<<<nb_groups, 32, 0, stream>>>(vx, y, nb_groups);
+    dequantize_block_turbo3_0<<<nb_groups, 64, 0, stream>>>(vx, y, nb_groups);
 }
 
 template<typename dst_t>
