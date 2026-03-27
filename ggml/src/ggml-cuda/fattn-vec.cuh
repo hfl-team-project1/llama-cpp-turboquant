@@ -94,10 +94,6 @@ static __global__ void flash_attn_ext_vec(
     constexpr dequantize_V_t dequantize_V = is_turbo3 ? nullptr : get_dequantize_V<type_V, float, V_rows_per_thread>();
 #endif // V_DOT2_F32_F16_AVAILABLE
 
-    // Turbo3: per-warp shared memory for inline WHT dequant (0 for non-turbo3)
-    constexpr int turbo3_smem = is_turbo3 ? D : 1;
-    __shared__ float s_turbo_wht[nwarps][turbo3_smem];
-
     const int ic0 = blockIdx.x * ncols; // Index of the Q/QKV column to work on.
 
     const int sequence = blockIdx.z / ne02;
@@ -114,6 +110,10 @@ static __global__ void flash_attn_ext_vec(
     static_assert(D % (2*WARP_SIZE) == 0, "D not divisible by 2*WARP_SIZE == 64.");
     constexpr int nwarps = nthreads / WARP_SIZE;
     const int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
+
+    // Turbo3: per-warp shared memory for inline WHT dequant (1 for non-turbo3 to avoid zero-size)
+    constexpr int turbo3_smem = is_turbo3 ? D : 1;
+    __shared__ float s_turbo_wht[nwarps][turbo3_smem];
     __builtin_assume(tid < nthreads);
 
     constexpr int ne_KQ      = ncols*D;
