@@ -84,13 +84,19 @@ static __global__ void flash_attn_ext_vec(
     constexpr int V_rows_per_thread = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 2*cpy_ne : 4;
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
 
-    constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ>();
-    constexpr bool Q_q8_1 = type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16;
+    constexpr bool is_turbo3 = type_K == GGML_TYPE_TURBO3_0;
+
+    constexpr vec_dot_KQ_t vec_dot_KQ = is_turbo3 ? nullptr : get_vec_dot_KQ<type_K, D, nthreads_KQ>();
+    constexpr bool Q_q8_1 = type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16 && !is_turbo3;
 #ifdef V_DOT2_F32_F16_AVAILABLE
-    constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread>();
+    constexpr dequantize_V_t dequantize_V = is_turbo3 ? nullptr : get_dequantize_V<type_V, half,  V_rows_per_thread>();
 #else
-    constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, float, V_rows_per_thread>();
+    constexpr dequantize_V_t dequantize_V = is_turbo3 ? nullptr : get_dequantize_V<type_V, float, V_rows_per_thread>();
 #endif // V_DOT2_F32_F16_AVAILABLE
+
+    // Turbo3: per-warp shared memory for inline WHT dequant (0 for non-turbo3)
+    constexpr int turbo3_smem = is_turbo3 ? D : 1;
+    __shared__ float s_turbo_wht[nwarps][turbo3_smem];
 
     const int ic0 = blockIdx.x * ncols; // Index of the Q/QKV column to work on.
 
@@ -236,6 +242,27 @@ static __global__ void flash_attn_ext_vec(
 #endif // V_DOT2_F32_F16_AVAILABLE
     }
 
+    // Turbo3: load Q as 4 floats per thread (bypasses cpy_ne Q prep which doesn't iterate for nthreads_KQ=32)
+    constexpr int turbo3_q_per_thread = D / WARP_SIZE; // 4 for D=128
+    float Q_turbo3[ncols][turbo3_q_per_thread];
+    if constexpr (is_turbo3) {
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            const float * Q_f = (const float *) (Q + j*nb01);
+            if (ncols == 1 || ic0 + j < int(ne01.z)) {
+#pragma unroll
+                for (int l = 0; l < turbo3_q_per_thread; l++) {
+                    Q_turbo3[j][l] = Q_f[threadIdx.x * turbo3_q_per_thread + l] * scale;
+                }
+            } else {
+#pragma unroll
+                for (int l = 0; l < turbo3_q_per_thread; l++) {
+                    Q_turbo3[j][l] = 0.0f;
+                }
+            }
+        }
+    }
+
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
     K     += blockIdx.y*nthreads * nb11;
     V     += blockIdx.y*nthreads * nb21;
@@ -259,7 +286,17 @@ static __global__ void flash_attn_ext_vec(
 
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
-                float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                float sum;
+                if constexpr (is_turbo3) {
+                    turbo3_wht_to_smem(K + i_KQ*nb11, s_turbo_wht[threadIdx.y]);
+                    sum = 0.0f;
+#pragma unroll
+                    for (int l = 0; l < turbo3_q_per_thread; l++) {
+                        sum += s_turbo_wht[threadIdx.y][threadIdx.x * turbo3_q_per_thread + l] * Q_turbo3[j][l];
+                    }
+                } else {
+                    sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                }
                 sum = warp_reduce_sum<nthreads_KQ>(sum);
 
                 if (use_logit_softcap) {
@@ -310,6 +347,49 @@ static __global__ void flash_attn_ext_vec(
         __syncwarp();
 #endif // GGML_USE_HIP
 
+        if constexpr (is_turbo3) {
+            // Turbo3 V: WHT dequant full row to smem, then accumulate per-thread elements
+#pragma unroll
+            for (int k0 = 0; k0 < WARP_SIZE; k0 += V_cols_per_iter) {
+                const int k = threadIdx.y*WARP_SIZE + k0 + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V);
+
+                turbo3_wht_to_smem(V + k*nb21, s_turbo_wht[threadIdx.y]);
+
+                const int v_base = (threadIdx.x % nthreads_V) * V_rows_per_thread;
+#ifdef V_DOT2_F32_F16_AVAILABLE
+                half2 KQ_k[ncols];
+#pragma unroll
+                for (int j = 0; j < ncols; ++j) {
+                    KQ_k[j] = __half2half2(KQ[j*nthreads + k]);
+                }
+#pragma unroll
+                for (int l = 0; l < V_rows_per_thread/2; ++l) {
+                    half2 v_h2 = __floats2half2_rn(
+                        s_turbo_wht[threadIdx.y][v_base + l*2],
+                        s_turbo_wht[threadIdx.y][v_base + l*2 + 1]);
+#pragma unroll
+                    for (int j = 0; j < ncols; ++j) {
+                        VKQ[j][l] += v_h2 * KQ_k[j];
+                    }
+                }
+#else
+                float KQ_k[ncols];
+#pragma unroll
+                for (int j = 0; j < ncols; ++j) {
+                    KQ_k[j] = KQ[j*nthreads + k];
+                }
+#pragma unroll
+                for (int l = 0; l < V_rows_per_thread/2; ++l) {
+#pragma unroll
+                    for (int j = 0; j < ncols; ++j) {
+                        VKQ[j][l].x += s_turbo_wht[threadIdx.y][v_base + l*2]     * KQ_k[j];
+                        VKQ[j][l].y += s_turbo_wht[threadIdx.y][v_base + l*2 + 1] * KQ_k[j];
+                    }
+                }
+#endif // V_DOT2_F32_F16_AVAILABLE
+            }
+        } else {
+            // Non-turbo3 V: existing dequant + accumulate
 #pragma unroll
         for (int k0 = 0; k0 < WARP_SIZE; k0 += V_cols_per_iter) {
             const int k = threadIdx.y*WARP_SIZE + k0 + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V);
@@ -365,6 +445,7 @@ static __global__ void flash_attn_ext_vec(
             }
 #endif // V_DOT2_F32_F16_AVAILABLE
         }
+        } // end else (non-turbo3 V)
     }
 
     if (sinks && blockIdx.y == 0) {

@@ -578,14 +578,72 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
 }
 
 // ============================================================================
-// Turbo3 inline dequant for flash attention
-// No inverse WHT — pre-rotate-queries handles rotation at graph level
+// Turbo3 inline dequant for flash attention (with inverse WHT)
 // ============================================================================
 
 static const __device__ float fattn_turbo3_centroids[8] = {
     -0.190685f, -0.117832f, -0.065717f, -0.021460f,
      0.021460f,  0.065717f,  0.117832f,  0.190685f
 };
+
+// WHT sign arrays for inverse rotation (signs2 → FWHT → signs1)
+static const __device__ float fattn_turbo3_wht_signs1[128] = {
+    -1.0f,  1.0f,  1.0f, -1.0f, -1.0f,  1.0f, -1.0f,  1.0f, -1.0f, -1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,
+     1.0f, -1.0f,  1.0f, -1.0f,  1.0f, -1.0f, -1.0f,  1.0f,  1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f, -1.0f, -1.0f,
+    -1.0f,  1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f, -1.0f,  1.0f, -1.0f,  1.0f,
+     1.0f,  1.0f,  1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,  1.0f, -1.0f,  1.0f,  1.0f,  1.0f,  1.0f, -1.0f,  1.0f,
+    -1.0f, -1.0f,  1.0f, -1.0f, -1.0f, -1.0f,  1.0f, -1.0f, -1.0f, -1.0f,  1.0f, -1.0f, -1.0f, -1.0f,  1.0f,  1.0f,
+     1.0f, -1.0f, -1.0f,  1.0f,  1.0f,  1.0f, -1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f, -1.0f,
+    -1.0f,  1.0f,  1.0f, -1.0f,  1.0f, -1.0f,  1.0f, -1.0f,  1.0f,  1.0f,  1.0f,  1.0f, -1.0f,  1.0f, -1.0f,  1.0f,
+     1.0f, -1.0f,  1.0f,  1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f
+};
+static const __device__ float fattn_turbo3_wht_signs2[128] = {
+     1.0f,  1.0f,  1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f, -1.0f, -1.0f, -1.0f,  1.0f, -1.0f, -1.0f, -1.0f,
+     1.0f,  1.0f, -1.0f, -1.0f,  1.0f, -1.0f,  1.0f, -1.0f,  1.0f, -1.0f, -1.0f,  1.0f, -1.0f,  1.0f,  1.0f,  1.0f,
+     1.0f,  1.0f, -1.0f, -1.0f, -1.0f,  1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,  1.0f,  1.0f,  1.0f, -1.0f,
+     1.0f, -1.0f,  1.0f,  1.0f,  1.0f, -1.0f, -1.0f,  1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,  1.0f,  1.0f,
+     1.0f, -1.0f,  1.0f, -1.0f, -1.0f, -1.0f, -1.0f,  1.0f, -1.0f,  1.0f, -1.0f,  1.0f, -1.0f, -1.0f,  1.0f,  1.0f,
+    -1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f, -1.0f, -1.0f, -1.0f, -1.0f,  1.0f, -1.0f, -1.0f,  1.0f, -1.0f,
+     1.0f, -1.0f,  1.0f,  1.0f,  1.0f, -1.0f, -1.0f,  1.0f, -1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f, -1.0f,  1.0f,
+    -1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f, -1.0f,  1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,  1.0f, -1.0f
+};
+
+// Dequant turbo3 block (128 elements = 4 sub-blocks) into shared memory with inverse WHT.
+// All 32 threads in the warp cooperate. Uses __syncwarp() between FWHT stages.
+static __device__ __forceinline__ void turbo3_wht_to_smem(
+        const char * __restrict__ K_c, float * __restrict__ smem) {
+    const block_turbo3_0 * blocks = (const block_turbo3_0 *) K_c;
+
+    // Step 1: centroid lookup × norm × signs2 (4 elements/thread)
+    for (int j = threadIdx.x; j < QK_TURBO3_GROUP; j += WARP_SIZE) {
+        const int ib = j / QK_TURBO3;
+        const int jj = j % QK_TURBO3;
+        const float norm = __half2float(blocks[ib].norm);
+        const uint8_t lo = (blocks[ib].qs[jj/4] >> ((jj%4)*2)) & 0x3;
+        const uint8_t hi = (blocks[ib].signs[jj/8] >> (jj%8)) & 0x1;
+        smem[j] = fattn_turbo3_centroids[lo | (hi << 2)] * norm * fattn_turbo3_wht_signs2[j];
+    }
+    __syncwarp();
+
+    // Step 2: parallel FWHT — 7 stages, 64 pairs each, 2 pairs/thread
+    for (int h = 1; h < QK_TURBO3_GROUP; h *= 2) {
+        for (int j = threadIdx.x; j < QK_TURBO3_GROUP/2; j += WARP_SIZE) {
+            const int idx = (j / h) * (h * 2) + (j % h);
+            const float a = smem[idx];
+            const float b = smem[idx + h];
+            smem[idx]     = a + b;
+            smem[idx + h] = a - b;
+        }
+        __syncwarp();
+    }
+
+    // Step 3: normalize × signs1 (4 elements/thread)
+    const float inv_sqrt = 0.08838834764831845f; // 1/sqrt(128)
+    for (int j = threadIdx.x; j < QK_TURBO3_GROUP; j += WARP_SIZE) {
+        smem[j] *= inv_sqrt * fattn_turbo3_wht_signs1[j];
+    }
+    __syncwarp();
+}
 
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_0(
