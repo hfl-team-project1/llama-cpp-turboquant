@@ -710,35 +710,110 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
 }
 
 // TurboQuant dequantization kernels
-// No inverse WHT rotation — pre-rotate-queries handles that at graph level
+// Turbo3: applies inverse WHT rotation (pre-rotate-queries proven unreliable on CUDA)
+// Turbo4: no inverse WHT (format designed for pre-rotate-queries, QJL depends on it)
 
 static const __device__ float turbo_centroids_3bit_dq[8] = {
     -0.190685f, -0.117832f, -0.065717f, -0.021460f,
      0.021460f,  0.065717f,  0.117832f,  0.190685f
 };
 
+// WHT sign arrays for inverse rotation (signs2 → FWHT → signs1)
+static const __device__ float dq_turbo_wht_signs1[128] = {
+    -1.0f,  1.0f,  1.0f, -1.0f, -1.0f,  1.0f, -1.0f,  1.0f,
+    -1.0f, -1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,
+     1.0f, -1.0f,  1.0f, -1.0f,  1.0f, -1.0f, -1.0f,  1.0f,
+     1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f, -1.0f, -1.0f,
+    -1.0f,  1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f,
+    -1.0f,  1.0f,  1.0f, -1.0f, -1.0f,  1.0f, -1.0f,  1.0f,
+     1.0f,  1.0f,  1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,
+     1.0f, -1.0f,  1.0f,  1.0f,  1.0f,  1.0f, -1.0f,  1.0f,
+    -1.0f, -1.0f,  1.0f, -1.0f, -1.0f, -1.0f,  1.0f, -1.0f,
+    -1.0f, -1.0f,  1.0f, -1.0f, -1.0f, -1.0f,  1.0f,  1.0f,
+     1.0f, -1.0f, -1.0f,  1.0f,  1.0f,  1.0f, -1.0f, -1.0f,
+     1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f, -1.0f,
+    -1.0f,  1.0f,  1.0f, -1.0f,  1.0f, -1.0f,  1.0f, -1.0f,
+     1.0f,  1.0f,  1.0f,  1.0f, -1.0f,  1.0f, -1.0f,  1.0f,
+     1.0f, -1.0f,  1.0f,  1.0f, -1.0f, -1.0f, -1.0f, -1.0f,
+    -1.0f,  1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f
+};
+static const __device__ float dq_turbo_wht_signs2[128] = {
+     1.0f,  1.0f,  1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f,
+     1.0f, -1.0f, -1.0f, -1.0f,  1.0f, -1.0f, -1.0f, -1.0f,
+     1.0f,  1.0f, -1.0f, -1.0f,  1.0f, -1.0f,  1.0f, -1.0f,
+     1.0f, -1.0f, -1.0f,  1.0f, -1.0f,  1.0f,  1.0f,  1.0f,
+     1.0f,  1.0f, -1.0f, -1.0f, -1.0f,  1.0f, -1.0f, -1.0f,
+    -1.0f, -1.0f, -1.0f, -1.0f,  1.0f,  1.0f,  1.0f, -1.0f,
+     1.0f, -1.0f,  1.0f,  1.0f,  1.0f, -1.0f, -1.0f,  1.0f,
+    -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,  1.0f,  1.0f,
+     1.0f, -1.0f,  1.0f, -1.0f, -1.0f, -1.0f, -1.0f,  1.0f,
+    -1.0f,  1.0f, -1.0f,  1.0f, -1.0f, -1.0f,  1.0f,  1.0f,
+    -1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f, -1.0f,
+    -1.0f, -1.0f, -1.0f,  1.0f, -1.0f, -1.0f,  1.0f, -1.0f,
+     1.0f, -1.0f,  1.0f,  1.0f,  1.0f, -1.0f, -1.0f,  1.0f,
+    -1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f, -1.0f,  1.0f,
+    -1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f, -1.0f,
+     1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,  1.0f, -1.0f
+};
+
+// Turbo3 dequant: processes 128-element groups (4 blocks) with inverse WHT
+// One GPU block per group, uses shared memory for the WHT butterfly
 template<typename dst_t>
-static __global__ void dequantize_block_turbo3_0(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb) {
-    const int i = blockIdx.x;
-    if (i >= nb) return;
+static __global__ void dequantize_block_turbo3_0(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb_groups) {
+    const int grp = blockIdx.x;
+    if (grp >= nb_groups) return;
 
-    const block_turbo3_0 * x = (const block_turbo3_0 *) vx + i;
-    dst_t * y = yy + i * QK_TURBO3;
+    const block_turbo3_0 * blocks = (const block_turbo3_0 *) vx + grp * 4;
+    dst_t * y = yy + grp * QK_TURBO3_GROUP;
 
-    const float norm = __half2float(x->norm);
+    __shared__ float s_data[QK_TURBO3_GROUP]; // 128 floats = 512 bytes
 
-    for (int j = threadIdx.x; j < QK_TURBO3; j += blockDim.x) {
-        const uint8_t low2 = (x->qs[j/4] >> ((j%4)*2)) & 0x3;
-        const uint8_t hi1  = (x->signs[j/8] >> (j%8)) & 0x1;
+    // Step 1: Dequant all 128 elements — centroid lookup × norm
+    for (int j = threadIdx.x; j < QK_TURBO3_GROUP; j += blockDim.x) {
+        const int ib = j / QK_TURBO3;
+        const int jj = j % QK_TURBO3;
+        const float norm = __half2float(blocks[ib].norm);
+
+        const uint8_t low2 = (blocks[ib].qs[jj/4] >> ((jj%4)*2)) & 0x3;
+        const uint8_t hi1  = (blocks[ib].signs[jj/8] >> (jj%8)) & 0x1;
         const uint8_t idx  = low2 | (hi1 << 2);
-        y[j] = (dst_t)(turbo_centroids_3bit_dq[idx] * norm);
+        s_data[j] = turbo_centroids_3bit_dq[idx] * norm;
+    }
+    __syncthreads();
+
+    // Step 2: Inverse WHT rotation (signs2 → FWHT → signs1)
+    // Single-threaded: 128-element WHT is ~1000 FP ops, negligible at GPU scale
+    if (threadIdx.x == 0) {
+        // Multiply by signs2
+        for (int i = 0; i < 128; i++) s_data[i] *= dq_turbo_wht_signs2[i];
+        // FWHT (self-inverse)
+        for (int h = 1; h < 128; h *= 2) {
+            for (int i = 0; i < 128; i += h * 2) {
+                for (int j = i; j < i + h; j++) {
+                    float a = s_data[j];
+                    float b = s_data[j + h];
+                    s_data[j]     = a + b;
+                    s_data[j + h] = a - b;
+                }
+            }
+        }
+        // Normalize by 1/sqrt(128) and multiply by signs1
+        const float inv_sqrt_128 = 0.08838834764831845f;
+        for (int i = 0; i < 128; i++) s_data[i] *= inv_sqrt_128 * dq_turbo_wht_signs1[i];
+    }
+    __syncthreads();
+
+    // Step 3: Write output
+    for (int j = threadIdx.x; j < QK_TURBO3_GROUP; j += blockDim.x) {
+        y[j] = (dst_t)s_data[j];
     }
 }
 
 template<typename dst_t>
 static void dequantize_row_turbo3_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
-    const int nb = k / QK_TURBO3;
-    dequantize_block_turbo3_0<<<nb, 32, 0, stream>>>(vx, y, nb);
+    GGML_ASSERT(k % QK_TURBO3_GROUP == 0);
+    const int nb_groups = k / QK_TURBO3_GROUP;
+    dequantize_block_turbo3_0<<<nb_groups, 32, 0, stream>>>(vx, y, nb_groups);
 }
 
 template<typename dst_t>

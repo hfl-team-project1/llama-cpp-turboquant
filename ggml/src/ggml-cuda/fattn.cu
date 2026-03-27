@@ -278,7 +278,6 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     GGML_ABORT("fatal error");
@@ -384,9 +383,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
-    // Turbo4 uses tile kernel (dequant to f16) — inline dequant too complex (QJL + full block).
-    // Turbo3 has inline vec kernel dequant — falls through to normal kernel selection.
-    if (K->type == GGML_TYPE_TURBO4_0) {
+    // Turbo types use tile kernel which dequantizes KV to f16 (with inverse WHT) before attention.
+    // Inline dequant impossible — inverse WHT is a 128-element group operation.
+    if (K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0) {
         return BEST_FATTN_KERNEL_TILE;
     }
 
