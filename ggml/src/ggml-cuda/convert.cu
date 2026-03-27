@@ -709,6 +709,76 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
     }
 }
 
+// TurboQuant dequantization kernels
+// No inverse WHT rotation — pre-rotate-queries handles that at graph level
+
+static const __device__ float turbo_centroids_3bit_dq[8] = {
+    -0.190685f, -0.117832f, -0.065717f, -0.021460f,
+     0.021460f,  0.065717f,  0.117832f,  0.190685f
+};
+
+template<typename dst_t>
+static __global__ void dequantize_block_turbo3_0(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb) {
+    const int i = blockIdx.x;
+    if (i >= nb) return;
+
+    const block_turbo3_0 * x = (const block_turbo3_0 *) vx + i;
+    dst_t * y = yy + i * QK_TURBO3;
+
+    const float norm = __half2float(x->norm);
+
+    for (int j = threadIdx.x; j < QK_TURBO3; j += blockDim.x) {
+        const uint8_t low2 = (x->qs[j/4] >> ((j%4)*2)) & 0x3;
+        const uint8_t hi1  = (x->signs[j/8] >> (j%8)) & 0x1;
+        const uint8_t idx  = low2 | (hi1 << 2);
+        y[j] = (dst_t)(turbo_centroids_3bit_dq[idx] * norm);
+    }
+}
+
+template<typename dst_t>
+static void dequantize_row_turbo3_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb = k / QK_TURBO3;
+    dequantize_block_turbo3_0<<<nb, 32, 0, stream>>>(vx, y, nb);
+}
+
+template<typename dst_t>
+static __global__ void dequantize_block_turbo4_0(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb) {
+    const int i = blockIdx.x;
+    if (i >= nb) return;
+
+    const block_turbo4_0 * x = (const block_turbo4_0 *) vx + i;
+    dst_t * y = yy + i * QK_TURBO4;
+
+    const float norm  = __half2float(x->norm);
+    const float rnorm = __half2float(x->rnorm);
+    const float qjl_scale = 1.2533141373155003f / 128.0f * rnorm; // sqrt(pi/2) / d * rnorm
+
+    for (int j = threadIdx.x; j < QK_TURBO4; j += blockDim.x) {
+        // Extract 3-bit index (bit-packed)
+        const int bit_offset = j * 3;
+        const int byte_idx   = bit_offset / 8;
+        const int bit_pos    = bit_offset % 8;
+        uint16_t raw = (uint16_t)x->qs[byte_idx];
+        if (byte_idx + 1 < QK_TURBO4 * 3 / 8) {
+            raw |= (uint16_t)x->qs[byte_idx + 1] << 8;
+        }
+        const uint8_t idx = (raw >> bit_pos) & 0x7;
+        const float centroid = turbo_centroids_3bit_dq[idx];
+
+        // QJL sign component
+        const float sign_f = (x->signs[j/8] & (1 << (j%8))) ? 1.0f : -1.0f;
+        const float qjl = sign_f * qjl_scale;
+
+        y[j] = (dst_t)((centroid + qjl) * norm);
+    }
+}
+
+template<typename dst_t>
+static void dequantize_row_turbo4_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb = k / QK_TURBO4;
+    dequantize_block_turbo4_0<<<nb, 128, 0, stream>>>(vx, y, nb);
+}
+
 to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q4_0:
@@ -760,6 +830,10 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
             return convert_unary_cont_cuda<nv_bfloat16>;
+        case GGML_TYPE_TURBO3_0:
+            return dequantize_row_turbo3_0_cuda;
+        case GGML_TYPE_TURBO4_0:
+            return dequantize_row_turbo4_0_cuda;
         default:
             return nullptr;
     }
@@ -813,6 +887,10 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:
             return convert_unary_cont_cuda<nv_bfloat16>;
+        case GGML_TYPE_TURBO3_0:
+            return dequantize_row_turbo3_0_cuda;
+        case GGML_TYPE_TURBO4_0:
+            return dequantize_row_turbo4_0_cuda;
         default:
             return nullptr;
     }

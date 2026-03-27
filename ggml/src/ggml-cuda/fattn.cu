@@ -372,12 +372,21 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_BF16:
             break;
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
+            break;
         default:
             return BEST_FATTN_KERNEL_NONE;
     }
 
     if (mask && mask->ne[2] != 1) {
         return BEST_FATTN_KERNEL_NONE;
+    }
+
+    // Turbo types use tile kernel which dequantizes KV to f16 before attention.
+    // Vec/MMA kernels don't have inline turbo dequant.
+    if (K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0) {
+        return BEST_FATTN_KERNEL_TILE;
     }
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
